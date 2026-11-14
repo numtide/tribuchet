@@ -24,18 +24,20 @@ use std::time::SystemTime;
 
 use tokio_stream::StreamExt as _;
 
+use tokio_rustls::rustls::crypto::CryptoProvider;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
+use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::rustls::{
     self, DigitallySignedStruct, DistinguishedName, RootCertStore, ServerConfig,
 };
 
-use crate::errors::{Result, err_ctx, err_msg};
+use crate::errors::{Result, chain, err_ctx, err_msg};
 
-/// What the roots were loaded from, so a reload is skipped while the
-/// files are untouched. Mtime and length together: a rewrite that keeps
+/// What the files were loaded from, so a reload is skipped while they
+/// are untouched. Mtime and length together: a rewrite that keeps
 /// the length still moves the mtime, and a bundle written within the
 /// mtime's resolution still changes its length when the roots differ.
 type Stamp = Vec<Option<(SystemTime, u64)>>;
@@ -163,18 +165,72 @@ impl ClientCertVerifier for ReloadingVerifier {
     }
 }
 
-/// The hub's own certificate and key. Unlike the trust roots these come
-/// from clan vars, written before the unit starts.
-fn identity(
-    cert: &Path,
-    key: &Path,
-) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+/// The hub's own certificate and key. Unlike the trust roots these must
+/// exist when the hub starts.
+fn identity(cert: &Path, key: &Path, provider: &CryptoProvider) -> Result<CertifiedKey> {
     let cert_pem = fs::read(cert).map_err(err_ctx("reading hub.crt"))?;
     let certs = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<StdResult<Vec<_>, _>>()
         .map_err(err_ctx("parsing hub.crt"))?;
     let key = PrivateKeyDer::from_pem_file(key).map_err(err_ctx("reading hub.key"))?;
-    Ok((certs, key))
+    CertifiedKey::from_der(certs, key, provider).map_err(err_ctx("pairing hub.crt with hub.key"))
+}
+
+/// A `ResolvesServerCert` that reloads the hub's certificate and key
+/// whenever either file changes, so a short-lived SVID that a helper
+/// rewrites is served without a restart.
+#[derive(Debug)]
+pub(super) struct ReloadingCert {
+    /// The certificate, then the key.
+    files: [PathBuf; 2],
+    provider: Arc<CryptoProvider>,
+    current: Mutex<(Stamp, Arc<CertifiedKey>)>,
+}
+
+impl ReloadingCert {
+    /// Fails when the pair cannot be loaded: a hub with nothing to
+    /// serve must not start.
+    pub(super) fn new(cert: &Path, key: &Path, provider: Arc<CryptoProvider>) -> Result<Self> {
+        let files = [cert.to_owned(), key.to_owned()];
+        let seen = stamp(&files);
+        let pair = identity(cert, key, &provider)?;
+        Ok(Self {
+            files,
+            provider,
+            current: Mutex::new((seen, Arc::new(pair))),
+        })
+    }
+
+    fn current(&self) -> Arc<CertifiedKey> {
+        let now = stamp(&self.files);
+        let mut cur = self.current.lock().unwrap();
+        if cur.0 == now {
+            return cur.1.clone();
+        }
+        let [cert, key] = &self.files;
+        match identity(cert, key, &self.provider) {
+            Ok(pair) => {
+                *cur = (now, Arc::new(pair));
+                tracing::info!(cert = %cert.display(), "loaded hub certificate");
+            }
+            // The certificate and the key are written one after the
+            // other, so a handshake in between sees a mismatched pair.
+            // Keep the last good one and the old stamp, so the next
+            // handshake tries again.
+            Err(e) => tracing::warn!(
+                cert = %cert.display(),
+                error = %chain(&e),
+                "keeping the previous hub certificate"
+            ),
+        }
+        cur.1.clone()
+    }
+}
+
+impl ResolvesServerCert for ReloadingCert {
+    fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.current())
+    }
 }
 
 pub(super) fn server_config(
@@ -182,11 +238,10 @@ pub(super) fn server_config(
     key: &Path,
     trust_files: Vec<PathBuf>,
 ) -> Result<ServerConfig> {
-    let (certs, key) = identity(cert, key)?;
-    let mut cfg = ServerConfig::builder()
-        .with_client_cert_verifier(Arc::new(ReloadingVerifier::new(trust_files)))
-        .with_single_cert(certs, key)
-        .map_err(err_ctx("building the TLS server config"))?;
+    let builder = ServerConfig::builder()
+        .with_client_cert_verifier(Arc::new(ReloadingVerifier::new(trust_files)));
+    let resolver = ReloadingCert::new(cert, key, builder.crypto_provider().clone())?;
+    let mut cfg = builder.with_cert_resolver(Arc::new(resolver));
     cfg.alpn_protocols = vec![b"h2".to_vec()];
     Ok(cfg)
 }
@@ -306,6 +361,8 @@ pub(super) fn incoming(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 
     use super::*;
@@ -317,10 +374,61 @@ mod tests {
         params.self_signed(&key).unwrap().pem()
     }
 
+    /// A self-signed leaf as (certificate, key) PEM.
+    fn leaf_pem(name: &str) -> (String, String) {
+        let key = KeyPair::generate().unwrap();
+        let params = CertificateParams::new(vec![name.to_owned()]).unwrap();
+        (params.self_signed(&key).unwrap().pem(), key.serialize_pem())
+    }
+
     fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(name);
         fs::write(&p, body).unwrap();
         p
+    }
+
+    /// Writes `body` with a fixed mtime, so the stamp does not depend on
+    /// the clock's resolution.
+    fn write_at(path: &Path, body: &str, secs: u64) {
+        fs::write(path, body).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_rewritten_cert_is_served_once_its_key_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let (crt, key) = (dir.path().join("hub.crt"), dir.path().join("hub.key"));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let der = |pem: &str| CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+        let served = |r: &ReloadingCert| r.current().cert[0].clone();
+
+        assert!(ReloadingCert::new(&crt, &key, provider.clone()).is_err());
+
+        let (a_crt, a_key) = leaf_pem("a");
+        write_at(&crt, &a_crt, 1);
+        write_at(&key, &a_key, 1);
+        let r = ReloadingCert::new(&crt, &key, provider).unwrap();
+        assert_eq!(served(&r), der(&a_crt));
+
+        let (b_crt, b_key) = leaf_pem("b");
+        write_at(&crt, &b_crt, 2);
+        write_at(&key, &b_key, 2);
+        assert_eq!(served(&r), der(&b_crt));
+
+        let (c_crt, c_key) = leaf_pem("c");
+        write_at(&crt, &c_crt, 3);
+        assert_eq!(served(&r), der(&b_crt));
+
+        // Key C gets key B's stamp: only the failed load above not
+        // being cached makes this reload.
+        assert_eq!(c_key.len(), b_key.len());
+        write_at(&key, &c_key, 2);
+        assert_eq!(served(&r), der(&c_crt));
     }
 
     #[test]
